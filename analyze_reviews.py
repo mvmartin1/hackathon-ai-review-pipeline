@@ -19,7 +19,7 @@ from slack_sdk.errors import SlackApiError
 
 load_dotenv()
 
-RATING_CUTOFF = 2.0
+RATING_CUTOFF = 5.0  # analyze all reviews regardless of rating
 MAX_REVIEW_CHARS = 500  # truncate very long reviews to keep prompt size reasonable
 
 
@@ -53,12 +53,12 @@ def build_prompt(reviews: pd.DataFrame) -> str:
     reviews_text = "\n\n---\n\n".join(review_blocks)
 
     return f"""You are analyzing customer reviews for Perpay, a buy-now-pay-later and credit-building platform.
-Your job is to identify which negative reviews contain ACTIONABLE items — meaning specific, reproducible bugs, technical failures, or product issues that an engineering or product team could investigate and fix.
+Your job is to identify which reviews contain ACTIONABLE items — meaning specific, reproducible bugs, technical failures, product defects, or process failures that an engineering, product, or operations team could investigate and fix.
 
-Actionable examples: login failures, verification codes not being received, app crashes, payment processing errors, account access issues, order/shipping errors.
-NOT actionable: pricing complaints, general dissatisfaction, competitor comparisons, subjective opinions.
+Actionable examples: login failures, verification codes not being received, app crashes, payment processing errors, account access issues, order/shipping errors, unauthorized or over-authorized payroll deductions, credit bureau reporting not working despite paying for it, packages marked delivered but not received while payments still demanded, returns blocked or ignored, direct deposit not recognized by the app after setup, accounts opened in a user's name without their consent, items arriving defective or suspected counterfeit, credit limits not updating after on-time payments, gig-worker income (DoorDash/Uber) incorrectly rejected despite being advertised as accepted, slow or no shipment communication.
+NOT actionable: vague pricing complaints with no specific failure, general dissatisfaction, competitor comparisons, subjective opinions about fees or interest rates where no system error is described.
 
-Here are {len(reviews)} negative reviews (≤{int(RATING_CUTOFF)}★) to analyze:
+Here are {len(reviews)} reviews to analyze:
 
 {reviews_text}
 
@@ -83,7 +83,7 @@ Respond with a JSON object in this exact format:
 Rules:
 - Only include reviews in actionable_items if they score 3 or higher (genuinely actionable).
 - Sort actionable_items by actionability_score descending.
-- Use consistent category labels (e.g. "Login/Auth Issue", "Verification Code Failure", "Payment Error", "Account Access", "App Crash", "Order/Shipping Issue", "Fraud/Identity Theft", "Pricing Complaint", "Customer Service Issue").
+- Use consistent category labels (e.g. "Login/Auth Issue", "Verification Code Failure", "Payment Error", "Account Access", "App Crash", "Order/Shipping Issue", "Slow Shipping", "Missing Delivery", "Return/Refund Blocked", "Unauthorized Charge", "Credit Reporting Failure", "Direct Deposit Not Recognized", "Defective/Counterfeit Product", "Fraudulent Account Opened", "Credit Limit Not Updating", "Gig Worker Eligibility Rejected", "Subscription/Fee Dispute", "Customer Service Issue").
 - theme_counts should cover ALL negative reviews, not just actionable ones.
 """
 
@@ -93,7 +93,7 @@ def call_claude(prompt: str) -> dict:
 
     message = client.messages.create(
         model="claude-sonnet-4-6",
-        max_tokens=4096,
+        max_tokens=8096,
         messages=[{"role": "user", "content": prompt}],
     )
 
@@ -108,15 +108,49 @@ def call_claude(prompt: str) -> dict:
     return json.loads(raw)
 
 
+PLATFORMS_WITHOUT_DIRECT_LINKS = {"BBB", "CreditKarma"}
+
+# Maps display group name → (emoji, set of category label substrings that belong to it)
+# Items not matching Order/Shipping, Customer Service, or Return/Refund fall into Core Issues.
+CATEGORY_GROUPS = [
+    ("Order/Shipping",    ":package:",                   {"order", "shipping", "delivery", "slow shipping", "missing delivery", "defective", "counterfeit"}),
+    ("Return/Refund",     ":leftwards_arrow_with_hook:", {"return", "refund"}),
+    ("Billing/Payments",  ":money_with_wings:",          {"payment", "charge", "billing", "subscription", "fee", "direct deposit"}),
+    ("Credit",            ":credit_card:",               {"credit reporting", "credit limit"}),
+    ("Fraud/Identity",    ":lock:",                      {"fraud", "identity", "fraudulent account"}),
+    ("Customer Service",  ":headphones:",                {"customer service"}),
+    ("Core Issues",       ":hammer_and_wrench:",         set()),  # catch-all
+]
+
+
+def review_url(row: dict) -> str:
+    if row.get("Source", "") in PLATFORMS_WITHOUT_DIRECT_LINKS:
+        return f"https://app.reviewtrackers.com/reviews/{row.get('Review ID', '')}"
+    return row.get("URL", "")
+
+
 def format_stars(rating: float) -> str:
     filled = int(rating)
     return "★" * filled + "☆" * (5 - filled)
 
 
-def build_slack_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str) -> list:
-    """Build Slack Block Kit blocks for the report."""
-    review_lookup = negative.set_index("Review ID").to_dict("index")
+def assign_group(category: str) -> str:
+    cat_lower = category.lower()
+    for group_name, _, keywords in CATEGORY_GROUPS[:-1]:  # skip catch-all
+        if any(kw in cat_lower for kw in keywords):
+            return group_name
+    return "Core Issues"
 
+
+def group_actionable_items(actionable: list) -> dict:
+    groups = {name: [] for name, _, _ in CATEGORY_GROUPS}
+    for item in actionable:
+        groups[assign_group(item["category"])].append(item)
+    return {k: v for k, v in groups.items() if v}  # drop empty groups
+
+
+def build_main_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str) -> list:
+    """Main message: header, stats, group summary, sentiment."""
     dates = pd.to_datetime(all_reviews["Published"], errors="coerce").dropna()
     date_min = dates.min().strftime("%Y-%m-%d") if not dates.empty else "N/A"
     date_max = dates.max().strftime("%Y-%m-%d") if not dates.empty else "N/A"
@@ -125,8 +159,14 @@ def build_slack_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analys
     source_str = "  |  ".join(f"{src}: *{cnt}*" for src, cnt in source_counts.items())
 
     actionable = analysis.get("actionable_items", [])
-    themes = analysis.get("theme_counts", {})
     summary = analysis.get("summary", "")
+    grouped = group_actionable_items(actionable)
+
+    group_lines = "\n".join(
+        f"{emoji}  *{name}*: {len(grouped.get(name, []))} items"
+        for name, emoji, _ in CATEGORY_GROUPS
+        if grouped.get(name)
+    )
 
     blocks = [
         {"type": "header", "text": {"type": "plain_text", "text": "Perpay AI Review Analysis Report", "emoji": True}},
@@ -142,67 +182,64 @@ def build_slack_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analys
                 "text": (
                     f"*Stats*\n"
                     f"Total reviews in export: *{len(all_reviews)}*\n"
-                    f"Negative reviews analyzed (≤{int(RATING_CUTOFF)}★): *{len(negative)}*\n"
+                    f"Reviews analyzed: *{len(negative)}*\n"
                     f"Date range: *{date_min} → {date_max}*\n"
-                    f"Sources (negative): {source_str}"
+                    f"Sources: {source_str}"
                 ),
             },
         },
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f":warning: *Most Actionable Items* ({len(actionable)} flagged)"},
+            "text": {"type": "mrkdwn", "text": f":warning: *Most Actionable Items* ({len(actionable)} flagged) — see threads below\n\n{group_lines}"},
         },
+        {"type": "divider"},
+        {"type": "section", "text": {"type": "mrkdwn", "text": ":bar_chart: *Sentiment Summary — Recurring Themes*"}},
+        {"type": "section", "text": {"type": "mrkdwn", "text": summary}},
     ]
-
-    if not actionable:
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "_No actionable items identified._"}})
-    else:
-        for i, item in enumerate(actionable, 1):
-            rid = item["review_id"]
-            row = review_lookup.get(rid, {})
-            score = item["actionability_score"]
-            score_bar = "█" * score + "░" * (5 - score)
-            rating = row.get("Rating", "?")
-            stars = ("★" * int(float(rating)) + "☆" * (5 - int(float(rating)))) if rating != "?" else "?"
-            review_text = str(row.get("Review", ""))[:200]
-            if len(str(row.get("Review", ""))) > 200:
-                review_text += "..."
-            url = row.get("URL", "")
-            url_line = f"\n<{url}|View review>" if url else ""
-
-            blocks.append(
-                {
-                    "type": "section",
-                    "text": {
-                        "type": "mrkdwn",
-                        "text": (
-                            f"*[{i}] {item['category']}*  `{score}/5  {score_bar}`\n"
-                            f"*Source:* {row.get('Source', 'N/A')}  |  *Rating:* {stars}  |  *Author:* {row.get('Author', 'N/A')}\n"
-                            f"*Why actionable:* {item['reason']}\n"
-                            f"_{review_text}_{url_line}"
-                        ),
-                    },
-                }
-            )
-
-    blocks.append({"type": "divider"})
-    blocks.append(
-        {"type": "section", "text": {"type": "mrkdwn", "text": ":bar_chart: *Sentiment Summary — Recurring Themes*"}}
-    )
-    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
-
-    if themes:
-        theme_lines = "\n".join(
-            f"• {theme}: *{count}*"
-            for theme, count in sorted(themes.items(), key=lambda x: x[1], reverse=True)
-        )
-        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Theme breakdown:*\n{theme_lines}"}})
 
     return blocks
 
 
-def post_to_slack(blocks: list):
+def build_category_header_blocks(group_name: str, emoji: str, count: int) -> list:
+    """Top-level message for a category — thread replies will contain individual items."""
+    return [
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f"{emoji} *{group_name}* — {count} actionable item{'s' if count != 1 else ''}"},
+        }
+    ]
+
+
+def build_item_blocks(i: int, item: dict, row: dict) -> list:
+    """Thread reply blocks for a single actionable item."""
+    score = item["actionability_score"]
+    score_bar = "█" * score + "░" * (5 - score)
+    rating = row.get("Rating", "?")
+    stars = ("★" * int(float(rating)) + "☆" * (5 - int(float(rating)))) if rating != "?" else "?"
+    review_text = str(row.get("Review", ""))[:200]
+    if len(str(row.get("Review", ""))) > 200:
+        review_text += "..."
+    url = review_url(row)
+    url_line = f"\n<{url}|View review>" if url else ""
+
+    return [
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*[{i}] {item['category']}*  `{score}/5  {score_bar}`\n"
+                    f"*Source:* {row.get('Source', 'N/A')}  |  *Rating:* {stars}  |  *Author:* {row.get('Author', 'N/A')}\n"
+                    f"*Why actionable:* {item['reason']}\n"
+                    f"_{review_text}_{url_line}"
+                ),
+            },
+        }
+    ]
+
+
+def post_to_slack(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str):
     token = os.environ.get("SLACK_BOT_TOKEN")
     channel = os.environ.get("SLACK_CHANNEL_ID")
     if not token or not channel:
@@ -210,9 +247,49 @@ def post_to_slack(blocks: list):
         return
 
     client = WebClient(token=token)
+    review_lookup = negative.set_index("Review ID").to_dict("index")
+    actionable = analysis.get("actionable_items", [])
+    grouped = group_actionable_items(actionable)
+
     try:
-        client.chat_postMessage(channel=channel, blocks=blocks, text="Perpay AI Review Analysis Report")
-        print(f"Report posted to Slack channel {channel}")
+        client.chat_postMessage(
+            channel=channel,
+            blocks=build_main_blocks(all_reviews, negative, analysis, csv_path),
+            text="Perpay AI Review Analysis Report",
+            unfurl_links=False,
+            unfurl_media=False,
+        )
+        print(f"Main report posted to Slack channel {channel}")
+
+        for group_name, emoji, _ in CATEGORY_GROUPS:
+            items = grouped.get(group_name, [])
+            if not items:
+                continue
+
+            # Post category as its own top-level message
+            cat_resp = client.chat_postMessage(
+                channel=channel,
+                blocks=build_category_header_blocks(group_name, emoji, len(items)),
+                text=f"{group_name} ({len(items)} items)",
+                unfurl_links=False,
+                unfurl_media=False,
+            )
+            cat_ts = cat_resp["ts"]
+
+            # Thread each item under the category message
+            for i, item in enumerate(items, 1):
+                row = review_lookup.get(item["review_id"], {})
+                client.chat_postMessage(
+                    channel=channel,
+                    thread_ts=cat_ts,
+                    blocks=build_item_blocks(i, item, row),
+                    text=f"[{i}] {item['category']}",
+                    unfurl_links=False,
+                    unfurl_media=False,
+                )
+
+            print(f"  Posted: {group_name} ({len(items)} items in thread)")
+
     except SlackApiError as e:
         print(f"Slack error: {e.response['error']}")
 
@@ -233,7 +310,6 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
     total = len(all_reviews)
     neg_count = len(negative)
     actionable = analysis.get("actionable_items", [])
-    themes = analysis.get("theme_counts", {})
     summary = analysis.get("summary", "")
 
     sep = "━" * 60
@@ -245,9 +321,9 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
 
     print(f"\nSTATS")
     print(f"  Total reviews in export:          {total}")
-    print(f"  Negative reviews analyzed (≤{int(RATING_CUTOFF)}★): {neg_count}")
+    print(f"  Reviews analyzed:                 {neg_count}")
     print(f"  Date range:                       {date_min} → {date_max}")
-    print(f"  Sources (negative):               {source_str}")
+    print(f"  Sources:                          {source_str}")
 
     print(f"\n{sep}")
     print(f"  MOST ACTIONABLE ITEMS  ({len(actionable)} flagged)")
@@ -272,7 +348,7 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
             if len(str(row.get("Review", ""))) > 200:
                 review_text += "..."
             print(f"      Review: \"{review_text}\"")
-            url = row.get("URL", "")
+            url = review_url(row)
             if url:
                 print(f"      URL:    {url}")
 
@@ -280,12 +356,6 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
     print("  SENTIMENT SUMMARY — Recurring Themes")
     print(sep)
     print(f"\n  {summary}")
-
-    if themes:
-        print("\n  Theme breakdown across negative reviews:")
-        for theme, count in sorted(themes.items(), key=lambda x: x[1], reverse=True):
-            bar = "▪" * min(count, 20)
-            print(f"    {theme:<35} {count:>3}  {bar}")
 
     print(f"\n{sep}\n")
 
@@ -318,8 +388,7 @@ def main():
 
     if os.environ.get("SLACK_BOT_TOKEN"):
         print("Posting to Slack...")
-        blocks = build_slack_blocks(all_reviews, negative, analysis, csv_path)
-        post_to_slack(blocks)
+        post_to_slack(all_reviews, negative, analysis, csv_path)
 
 
 if __name__ == "__main__":
