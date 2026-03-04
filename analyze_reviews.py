@@ -149,21 +149,37 @@ def group_actionable_items(actionable: list) -> dict:
     return {k: v for k, v in groups.items() if v}  # drop empty groups
 
 
-def build_main_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str) -> list:
+def build_platform_stats(all_reviews: pd.DataFrame) -> str:
+    """Build per-platform volume + positive/negative breakdown string for Slack."""
+    lines = []
+    for src, grp in all_reviews.groupby("Source"):
+        total = len(grp)
+        pos = (grp["Rating"] >= 4).sum()
+        neg = (grp["Rating"] <= 3).sum()
+        pos_pct = round(pos / total * 100) if total else 0
+        neg_pct = round(neg / total * 100) if total else 0
+        avg = grp["Rating"].mean()
+        lines.append(
+            f"  • *{src}*: {total} reviews  |  ★ avg {avg:.1f}  |  :thumbsup: {pos} ({pos_pct}%)  :thumbsdown: {neg} ({neg_pct}%)"
+        )
+    return "\n".join(lines)
+
+
+def build_main_blocks(all_reviews: pd.DataFrame, analysis: dict, csv_path: str) -> list:
     """Main message: header, stats, group summary, sentiment."""
     dates = pd.to_datetime(all_reviews["Published"], errors="coerce").dropna()
     date_min = dates.min().strftime("%Y-%m-%d") if not dates.empty else "N/A"
     date_max = dates.max().strftime("%Y-%m-%d") if not dates.empty else "N/A"
 
-    source_counts = negative["Source"].value_counts().to_dict()
-    source_str = "  |  ".join(f"{src}: *{cnt}*" for src, cnt in source_counts.items())
+    avg_rating = all_reviews["Rating"].mean()
+    platform_stats = build_platform_stats(all_reviews)
 
     actionable = analysis.get("actionable_items", [])
     summary = analysis.get("summary", "")
     grouped = group_actionable_items(actionable)
 
     group_lines = "\n".join(
-        f"{emoji}  *{name}*: {len(grouped.get(name, []))} items"
+        f"{emoji}  *{name}*: {len(grouped.get(name, []))} reviews"
         for name, emoji, _ in CATEGORY_GROUPS
         if grouped.get(name)
     )
@@ -181,17 +197,16 @@ def build_main_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysi
                 "type": "mrkdwn",
                 "text": (
                     f"*Stats*\n"
-                    f"Total reviews in export: *{len(all_reviews)}*\n"
-                    f"Reviews analyzed: *{len(negative)}*\n"
-                    f"Date range: *{date_min} → {date_max}*\n"
-                    f"Sources: {source_str}"
+                    f"Total reviews in export: *{len(all_reviews)}*  |  Avg rating: *★ {avg_rating:.2f}*\n"
+                    f"Date range: *{date_min} → {date_max}*\n\n"
+                    f"*Per-platform breakdown:*\n{platform_stats}"
                 ),
             },
         },
         {"type": "divider"},
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f":warning: *Most Actionable Items* ({len(actionable)} flagged) — see threads below\n\n{group_lines}"},
+            "text": {"type": "mrkdwn", "text": f":warning: *Most Actionable Themes* ({len(actionable)} flagged) — see threads below\n\n{group_lines}"},
         },
         {"type": "divider"},
         {"type": "section", "text": {"type": "mrkdwn", "text": ":bar_chart: *Sentiment Summary — Recurring Themes*"}},
@@ -201,12 +216,29 @@ def build_main_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysi
     return blocks
 
 
-def build_category_header_blocks(group_name: str, emoji: str, count: int) -> list:
+def build_category_header_blocks(group_name: str, emoji: str, items: list, review_lookup: dict, total_neg: int) -> list:
     """Top-level message for a category — thread replies will contain individual items."""
+    count = len(items)
+    pct = round(count / total_neg * 100) if total_neg else 0
+
+    # Pick the top-scoring item's review as the example
+    top_item = max(items, key=lambda x: x.get("actionability_score", 0))
+    top_row = review_lookup.get(top_item["review_id"], {})
+    example_text = str(top_row.get("Review", ""))[:200]
+    if len(str(top_row.get("Review", ""))) > 200:
+        example_text += "..."
+    example_author = top_row.get("Author", "Unknown")
+
     return [
         {
             "type": "section",
-            "text": {"type": "mrkdwn", "text": f"{emoji} *{group_name}* — {count} actionable item{'s' if count != 1 else ''}"},
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"{emoji} *{group_name}* — {count} actionable review{'s' if count != 1 else ''} ({pct}% of negative reviews)\n\n"
+                    f"_Example: \"{example_text}\" — {example_author}_"
+                ),
+            },
         }
     ]
 
@@ -250,11 +282,12 @@ def post_to_slack(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: d
     review_lookup = negative.set_index("Review ID").to_dict("index")
     actionable = analysis.get("actionable_items", [])
     grouped = group_actionable_items(actionable)
+    total_neg = int((all_reviews["Rating"] <= 3).sum())
 
     try:
         client.chat_postMessage(
             channel=channel,
-            blocks=build_main_blocks(all_reviews, negative, analysis, csv_path),
+            blocks=build_main_blocks(all_reviews, analysis, csv_path),
             text="Perpay AI Review Analysis Report",
             unfurl_links=False,
             unfurl_media=False,
@@ -269,8 +302,8 @@ def post_to_slack(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: d
             # Post category as its own top-level message
             cat_resp = client.chat_postMessage(
                 channel=channel,
-                blocks=build_category_header_blocks(group_name, emoji, len(items)),
-                text=f"{group_name} ({len(items)} items)",
+                blocks=build_category_header_blocks(group_name, emoji, items, review_lookup, total_neg),
+                text=f"{group_name} ({len(items)} reviews)",
                 unfurl_links=False,
                 unfurl_media=False,
             )
@@ -303,12 +336,8 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
     date_min = dates.min().strftime("%Y-%m-%d") if not dates.empty else "N/A"
     date_max = dates.max().strftime("%Y-%m-%d") if not dates.empty else "N/A"
 
-    # Source breakdown (negative reviews)
-    source_counts = negative["Source"].value_counts().to_dict()
-    source_str = " | ".join(f"{src}: {cnt}" for src, cnt in source_counts.items())
-
     total = len(all_reviews)
-    neg_count = len(negative)
+    avg_rating = all_reviews["Rating"].mean()
     actionable = analysis.get("actionable_items", [])
     summary = analysis.get("summary", "")
 
@@ -321,12 +350,20 @@ def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: di
 
     print(f"\nSTATS")
     print(f"  Total reviews in export:          {total}")
-    print(f"  Reviews analyzed:                 {neg_count}")
+    print(f"  Avg star rating:                  ★ {avg_rating:.2f}")
     print(f"  Date range:                       {date_min} → {date_max}")
-    print(f"  Sources:                          {source_str}")
+    print("\n  Per-platform breakdown:")
+    for src, grp in all_reviews.groupby("Source"):
+        t = len(grp)
+        pos = int((grp["Rating"] >= 4).sum())
+        neg = int((grp["Rating"] <= 3).sum())
+        pos_pct = round(pos / t * 100) if t else 0
+        neg_pct = round(neg / t * 100) if t else 0
+        avg = grp["Rating"].mean()
+        print(f"    {src}: {t} reviews  |  ★ avg {avg:.1f}  |  👍 {pos} ({pos_pct}%)  👎 {neg} ({neg_pct}%)")
 
     print(f"\n{sep}")
-    print(f"  MOST ACTIONABLE ITEMS  ({len(actionable)} flagged)")
+    print(f"  MOST ACTIONABLE THEMES  ({len(actionable)} flagged)")
     print(sep)
 
     if not actionable:
