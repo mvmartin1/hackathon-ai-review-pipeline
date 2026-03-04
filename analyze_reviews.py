@@ -14,6 +14,8 @@ from pathlib import Path
 import pandas as pd
 from anthropic import Anthropic
 from dotenv import load_dotenv
+from slack_sdk import WebClient
+from slack_sdk.errors import SlackApiError
 
 load_dotenv()
 
@@ -109,6 +111,110 @@ def call_claude(prompt: str) -> dict:
 def format_stars(rating: float) -> str:
     filled = int(rating)
     return "★" * filled + "☆" * (5 - filled)
+
+
+def build_slack_blocks(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str) -> list:
+    """Build Slack Block Kit blocks for the report."""
+    review_lookup = negative.set_index("Review ID").to_dict("index")
+
+    dates = pd.to_datetime(all_reviews["Published"], errors="coerce").dropna()
+    date_min = dates.min().strftime("%Y-%m-%d") if not dates.empty else "N/A"
+    date_max = dates.max().strftime("%Y-%m-%d") if not dates.empty else "N/A"
+
+    source_counts = negative["Source"].value_counts().to_dict()
+    source_str = "  |  ".join(f"{src}: *{cnt}*" for src, cnt in source_counts.items())
+
+    actionable = analysis.get("actionable_items", [])
+    themes = analysis.get("theme_counts", {})
+    summary = analysis.get("summary", "")
+
+    blocks = [
+        {"type": "header", "text": {"type": "plain_text", "text": "Perpay AI Review Analysis Report", "emoji": True}},
+        {
+            "type": "context",
+            "elements": [{"type": "mrkdwn", "text": f"Generated {datetime.now().strftime('%Y-%m-%d %H:%M')}  |  Source: `{Path(csv_path).name}`"}],
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {
+                "type": "mrkdwn",
+                "text": (
+                    f"*Stats*\n"
+                    f"Total reviews in export: *{len(all_reviews)}*\n"
+                    f"Negative reviews analyzed (≤{int(RATING_CUTOFF)}★): *{len(negative)}*\n"
+                    f"Date range: *{date_min} → {date_max}*\n"
+                    f"Sources (negative): {source_str}"
+                ),
+            },
+        },
+        {"type": "divider"},
+        {
+            "type": "section",
+            "text": {"type": "mrkdwn", "text": f":warning: *Most Actionable Items* ({len(actionable)} flagged)"},
+        },
+    ]
+
+    if not actionable:
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": "_No actionable items identified._"}})
+    else:
+        for i, item in enumerate(actionable, 1):
+            rid = item["review_id"]
+            row = review_lookup.get(rid, {})
+            score = item["actionability_score"]
+            score_bar = "█" * score + "░" * (5 - score)
+            rating = row.get("Rating", "?")
+            stars = ("★" * int(float(rating)) + "☆" * (5 - int(float(rating)))) if rating != "?" else "?"
+            review_text = str(row.get("Review", ""))[:200]
+            if len(str(row.get("Review", ""))) > 200:
+                review_text += "..."
+            url = row.get("URL", "")
+            url_line = f"\n<{url}|View review>" if url else ""
+
+            blocks.append(
+                {
+                    "type": "section",
+                    "text": {
+                        "type": "mrkdwn",
+                        "text": (
+                            f"*[{i}] {item['category']}*  `{score}/5  {score_bar}`\n"
+                            f"*Source:* {row.get('Source', 'N/A')}  |  *Rating:* {stars}  |  *Author:* {row.get('Author', 'N/A')}\n"
+                            f"*Why actionable:* {item['reason']}\n"
+                            f"_{review_text}_{url_line}"
+                        ),
+                    },
+                }
+            )
+
+    blocks.append({"type": "divider"})
+    blocks.append(
+        {"type": "section", "text": {"type": "mrkdwn", "text": ":bar_chart: *Sentiment Summary — Recurring Themes*"}}
+    )
+    blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": summary}})
+
+    if themes:
+        theme_lines = "\n".join(
+            f"• {theme}: *{count}*"
+            for theme, count in sorted(themes.items(), key=lambda x: x[1], reverse=True)
+        )
+        blocks.append({"type": "section", "text": {"type": "mrkdwn", "text": f"*Theme breakdown:*\n{theme_lines}"}})
+
+    return blocks
+
+
+def post_to_slack(blocks: list):
+    token = os.environ.get("SLACK_BOT_TOKEN")
+    channel = os.environ.get("SLACK_CHANNEL_ID")
+    if not token or not channel:
+        print("Slack credentials not set — skipping Slack post.")
+        return
+
+    client = WebClient(token=token)
+    try:
+        client.chat_postMessage(channel=channel, blocks=blocks, text="Perpay AI Review Analysis Report")
+        print(f"Report posted to Slack channel {channel}")
+    except SlackApiError as e:
+        print(f"Slack error: {e.response['error']}")
 
 
 def print_report(all_reviews: pd.DataFrame, negative: pd.DataFrame, analysis: dict, csv_path: str):
@@ -209,6 +315,11 @@ def main():
     analysis = call_claude(prompt)
 
     print_report(all_reviews, negative, analysis, csv_path)
+
+    if os.environ.get("SLACK_BOT_TOKEN"):
+        print("Posting to Slack...")
+        blocks = build_slack_blocks(all_reviews, negative, analysis, csv_path)
+        post_to_slack(blocks)
 
 
 if __name__ == "__main__":
