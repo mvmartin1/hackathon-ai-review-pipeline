@@ -12,10 +12,11 @@ from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from anthropic import Anthropic
 from dotenv import load_dotenv
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+
+from helpers import call_claude
 
 load_dotenv()
 
@@ -88,6 +89,7 @@ Rules:
 """
 
 
+<<<<<<< Updated upstream
 def call_claude(prompt: str) -> dict:
     client = Anthropic(api_key=os.environ["ANTHROPIC_API_KEY"])
 
@@ -107,6 +109,8 @@ def call_claude(prompt: str) -> dict:
 
     return json.loads(raw)
 
+=======
+>>>>>>> Stashed changes
 
 PLATFORMS_WITHOUT_DIRECT_LINKS = {"BBB", "CreditKarma"}
 
