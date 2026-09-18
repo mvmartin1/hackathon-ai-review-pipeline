@@ -65,6 +65,83 @@ Export your reviews as a CSV from the ReviewTrackers dashboard. The script expec
 
 ---
 
+## Stripping PII
+
+`strip_pii.py` removes personal information from a review export before it is
+analyzed, shared, or handed to an LLM. It has no dependencies beyond the standard
+library and works on ReviewTrackers exports as well as other sources.
+
+```bash
+python strip_pii.py export-2026-09-18.csv --salt "$PII_SALT" --allow-domain perpay.com
+# -> export-2026-09-18.clean.csv
+```
+
+The cleaned file drops straight into the rest of the pipeline:
+
+```bash
+python analyze_reviews.py export-2026-09-18.clean.csv
+```
+
+### What it does
+
+Every column gets one of five actions — `keep`, `scrub`, `redact`, `hash`, `drop`.
+ReviewTrackers exports are detected by their headers and use a built-in profile;
+any other file falls back to header-name heuristics, so a Trustpilot or App Store
+export with columns like `customer_email` or `ssn` is handled without configuration.
+
+Inside free-text columns (`Review`, `Title`, `Responses`, `Notes`, …) it redacts
+emails, phone numbers, SSNs, Luhn-validated payment cards, IP addresses, street
+addresses, dates of birth, account numbers, and URL query strings. It also removes
+the reviewer's own name where it appears in the review body, and names people
+volunteer in the text ("My name is …", "Sincerely, …").
+
+Names and IDs become stable pseudonyms rather than being deleted, so rows stay
+joinable:
+
+```
+Author: Dana Whitfield  →  [PERSON:0a3fa8ce]
+Review: "Dana here, call 215-555-0147"  →  "[PERSON:0a3fa8ce] here, call [PHONE]"
+```
+
+Pass the same `--salt` (or set `$PII_SALT`) to get identical pseudonyms across
+runs and across exports; without one, a random salt is generated per run.
+
+### Options
+
+| Flag | Purpose |
+|---|---|
+| `-o, --output` | Output path (default `<input>.clean.<ext>`) |
+| `--salt` | Pseudonym salt; also read from `$PII_SALT` |
+| `--allow-domain` | Keep emails at a company domain, e.g. `perpay.com` |
+| `--profile` | `auto` (default), `reviewtrackers`, or `generic` |
+| `--set COL=ACTION` | Override one column, e.g. `--set City=drop` |
+| `--config FILE` | JSON file of `{"Column": "action"}` overrides |
+| `--unknown` | Action for unrecognized columns (default `scrub`) |
+| `--audit` | Report what would be redacted; write nothing |
+| `--report FILE` | Write the per-column and per-detector counts to JSON |
+| `--llm` | Second pass with Claude for residual names (opt-in) |
+| `--selftest` | Run the built-in detector tests |
+
+`--llm` sends the already-scrubbed text to the Anthropic API. The regex pass runs
+first either way, so raw identifiers are removed before anything leaves the machine.
+
+### Verifying
+
+Every run re-scans its own output and reports anything a detector still matches:
+
+```
+profile: reviewtrackers | columns: 28 | name columns: ['Author']
+dropping: Address, Zip
+wrote 15450 records -> export-2026-09-18.clean.csv
+verify: clean
+detections: {"email": 59, "name_from_column": 2180, "phone": 9, "street_address": 26, ...}
+```
+
+Automated redaction is a safety net, not a guarantee. Spot-check the output before
+sharing an export outside the team, and route anything questionable to Compliance.
+
+---
+
 ## Usage
 
 ```bash
