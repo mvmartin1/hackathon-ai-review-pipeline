@@ -212,6 +212,8 @@ COLUMN_HEURISTICS = [
                 r"file|field|event|page|screen|plan|tier|category)[\s_\-]*name", re.I), "keep"),
     (re.compile(r"(author|reviewer|\bname\b|full.?name|first.?name|last.?name|customer.?name|"
                 r"user.?name|username|display.?name|contact|nickname|handle|profile)", re.I), "hash"),
+    (re.compile(r"(\btoken\b|api.?key|secret|password|passwd|credential|auth.?key)", re.I), "drop"),
+    (re.compile(r"(\buuid\b|\bguid\b|session.?id|visitor.?id|anonymous.?id)", re.I), "hash"),
     (re.compile(r"(customer.?id|user.?id|member.?id|account.?id|external.?id|"
                 r"client.?id|subscriber.?id|employee.?id)", re.I), "hash"),
     (re.compile(r"(review|comment|text|body|content|title|description|note|response|"
@@ -703,7 +705,13 @@ def main(argv=None):
             print("verify: clean", file=sys.stderr)
 
     summary = {k: v for k, v in sorted(scrubber.hits.items()) if not k.startswith("col:")}
-    print("detections: " + (json.dumps(summary) if summary else "none"), file=sys.stderr)
+    col_actions = Counter()
+    for k, v in scrubber.hits.items():
+        if k.startswith("col:"):
+            col_actions[k.rsplit(":", 1)[1]] += v
+    print("column actions: " + (json.dumps(dict(sorted(col_actions.items())))
+                                if col_actions else "none"), file=sys.stderr)
+    print("in-text detections: " + (json.dumps(summary) if summary else "none"), file=sys.stderr)
 
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2))
@@ -810,6 +818,8 @@ def selftest():
               ("Review Body", "scrub"), ("Rating", "scrub"),
               ("ip_address", "redact"), ("Mailing Address", "drop"),
               ("name", "hash"), ("Product Name", "keep"),
+              ("uuid", "hash"), ("session_id", "hash"), ("api_key", "drop"),
+              ("password", "drop"),
               ("Original Language Name", "keep")]
     for header, expected in checks:
         actual = classify_column(header, {}, "scrub")
