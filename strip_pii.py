@@ -397,16 +397,31 @@ Return the substrings verbatim as they appear. Return {{"spans": []}} if there i
 """
 
 
+def load_api_key() -> bool:
+    """Honor the repo convention of keeping ANTHROPIC_API_KEY in .env, searching
+    upward so this works from a worktree too."""
+    if os.environ.get("ANTHROPIC_API_KEY"):
+        return True
+    try:
+        from dotenv import load_dotenv, find_dotenv
+    except ImportError:
+        return False
+    found = find_dotenv(usecwd=True)
+    if found:
+        load_dotenv(found)
+    return bool(os.environ.get("ANTHROPIC_API_KEY"))
+
+
 def llm_find_spans(texts, scrubber: Scrubber):
-    """Ask Claude for residual identifiers. Returns {literal: replacement}."""
+    """Ask Claude for residual identifiers. Returns ({literal: replacement}, failures)."""
     try:
         from helpers import call_claude
     except ImportError:
-        print("warning: --llm requires helpers.py and the anthropic package; skipping",
-              file=sys.stderr)
-        return {}
+        print("error: --llm requires helpers.py and the anthropic package", file=sys.stderr)
+        return {}, 1
 
     mapping = {}
+    failures = 0
     batch = [t for t in texts if t and len(t.strip()) > 10]
     for i in range(0, len(batch), LLM_BATCH):
         chunk = batch[i:i + LLM_BATCH]
@@ -414,14 +429,22 @@ def llm_find_spans(texts, scrubber: Scrubber):
         try:
             result = call_claude(LLM_PROMPT.format(n=len(chunk), snippets=snippets), max_tokens=2048)
         except Exception as exc:  # network / parse failures shouldn't lose the run
-            print(f"warning: LLM pass failed on batch {i // LLM_BATCH}: {exc}", file=sys.stderr)
+            failures += 1
+            print(f"error: LLM batch {i // LLM_BATCH} failed ({type(exc).__name__}: {exc}); "
+                  f"those rows got the regex pass only", file=sys.stderr)
             continue
         for span in result.get("spans", []):
             span = (span or "").strip()
             if len(span) < 3 or span.startswith("["):
                 continue
+            # LLM spans are applied globally, so a single word that is also an
+            # ordinary word ("Will", "Grace") would shred unrelated rows.
+            if len(span.split()) == 1 and (span.lower() in AMBIGUOUS_NAME_WORDS
+                                           or span.lower() in NAME_STOPWORDS):
+                scrubber.hits["llm_span_skipped_ambiguous"] += 1
+                continue
             mapping[span] = scrubber.pseudonym(span, "PERSON")
-    return mapping
+    return mapping, failures
 
 
 def apply_spans(text: str, mapping: dict, scrubber: Scrubber) -> str:
@@ -671,10 +694,16 @@ def main(argv=None):
         else:
             out_rows.append(process_row(rec, policy, scrubber, name_columns))
 
+    llm_failures = 0
     if args.llm:
+        if not load_api_key():
+            print("error: --llm needs ANTHROPIC_API_KEY (export it or put it in .env). "
+                  "Refusing to write a file that claims an LLM pass it did not get.",
+                  file=sys.stderr)
+            return 2
         text_cols = [h for h, a in policy.items() if a == "scrub"]
         texts = [str(r.get(c, "")) for r in out_rows for c in text_cols if r.get(c)]
-        mapping = llm_find_spans(texts, scrubber)
+        mapping, llm_failures = llm_find_spans(texts, scrubber)
         if mapping:
             print(f"LLM pass: {len(mapping)} residual span(s) to redact", file=sys.stderr)
             for row in out_rows:
@@ -683,6 +712,8 @@ def main(argv=None):
                         row[c] = apply_spans(str(row[c]), mapping, scrubber)
 
     report = {
+        "llm_pass": ("failed" if llm_failures else "ok") if args.llm else "not run",
+        "llm_failed_batches": llm_failures,
         "input": str(in_path),
         "records": len(out_rows),
         "profile": profile_name,
@@ -716,6 +747,11 @@ def main(argv=None):
     if args.report:
         Path(args.report).write_text(json.dumps(report, indent=2))
         print(f"report -> {args.report}", file=sys.stderr)
+
+    if llm_failures:
+        print(f"error: {llm_failures} LLM batch(es) failed — output had the regex pass "
+              f"only and is NOT fully LLM-reviewed", file=sys.stderr)
+        return 1
     return 0
 
 
@@ -787,6 +823,16 @@ def selftest():
     got = s.scrub("Will Turner here, unhappy", names=["Will Turner"])
     if "[PERSON:" not in got:
         failures.append(f"  full ambiguous name not redacted: {got!r}")
+
+    # LLM spans: multi-word names apply, bare ambiguous words are skipped
+    m = {"Marcus Delacroix": "[PERSON:x]"}
+    if "[PERSON:x]" not in apply_spans("spoke to Marcus Delacroix today", m, s):
+        failures.append("  llm span not applied")
+    if apply_spans("I will not pay", {"will": "[PERSON:y]"}, s) == "I will not pay":
+        pass  # case-sensitive literal, fine
+    got = apply_spans("Christmas came late", {"Chris": "[PERSON:z]"}, s)
+    if "[PERSON:z]" in got:
+        failures.append(f"  llm span broke a word boundary: {got!r}")
 
     # Allowed company domains survive; customer addresses don't
     a = Scrubber(salt="test-salt", allow_domains=["perpay.com"])

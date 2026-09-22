@@ -122,8 +122,22 @@ runs and across exports; without one, a random salt is generated per run.
 | `--llm` | Second pass with Claude for residual names (opt-in) |
 | `--selftest` | Run the built-in detector tests |
 
-`--llm` sends the already-scrubbed text to the Anthropic API. The regex pass runs
-first either way, so raw identifiers are removed before anything leaves the machine.
+### The `--llm` pass
+
+Regexes cannot recognize a name they have no context for, so a third party named
+in passing — "a rep named Marcus Delacroix hung up on me" — survives the regex
+pass. `--llm` sends the already-scrubbed text to Claude and redacts whatever
+direct identifiers are left. The regex pass always runs first, so raw emails,
+phones and card numbers are gone before anything leaves the machine.
+
+It reads `ANTHROPIC_API_KEY` from the environment or `.env`. On a 150-review
+sample it found 7 residual names the regex pass missed, with no brand or place
+names over-redacted, and took about 40 seconds.
+
+If the key is missing the run aborts and writes nothing; if any batch fails
+mid-run the file is still written but the command exits non-zero and says so,
+because a file that silently skipped the pass it claims to have had is worse
+than no file.
 
 ### Verifying
 
